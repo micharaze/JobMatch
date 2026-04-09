@@ -1,0 +1,116 @@
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: services/scraper/Dockerfile
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3001
+      - DB_PATH=/app/data/scraper.db
+      - LOG_LEVEL=info
+    restart: unless-stopped
+
+  extractor:
+    build:
+      context: .
+      dockerfile: services/extractor/Dockerfile
+    ports:
+      - "3002:3002"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3002
+      - DB_PATH=/app/data/scraper.db
+      - LOG_LEVEL=info
+      - GEMMA_BASE_URL=http://host.docker.internal:11434/v1
+      - GEMMA_API_KEY=ollama
+      - GEMMA_MODEL=gemma4:e4b
+      - OLLAMA_KEEP_ALIVE=5m
+      - PROCESS_INTERVAL_MS=0
+    depends_on:
+      - scraper
+    restart: unless-stopped
+
+  embedder:
+    build:
+      context: .
+      dockerfile: services/embedder/Dockerfile
+    ports:
+      - "3003:3003"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3003
+      - DB_PATH=/app/data/scraper.db
+      - LANCE_DIR=/app/data/vectors
+      - LOG_LEVEL=info
+      - EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
+      - EMBEDDING_API_KEY=ollama
+      - EMBEDDING_MODEL=embeddinggemma
+      - EMBEDDING_DIM=768
+      - EMBEDDING_BATCH_SIZE=32
+    depends_on:
+      - extractor
+    restart: unless-stopped
+
+  matcher:
+    build:
+      context: .
+      dockerfile: services/matcher/Dockerfile
+    ports:
+      - "3004:3004"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3004
+      - DB_PATH=/app/data/scraper.db
+      - LANCE_DIR=/app/data/vectors
+      - LOG_LEVEL=info
+      - EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
+      - EMBEDDING_API_KEY=ollama
+      - EMBEDDING_MODEL=embeddinggemma
+      - EMBEDDING_DIM=768
+      - MATCHER_TOP_K=5
+      - KEEP_ALIVE_MS=300000
+    depends_on:
+      - embedder
+    restart: unless-stopped
+
+  validator:
+    build:
+      context: .
+      dockerfile: services/validator/Dockerfile
+    ports:
+      - "3005:3005"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3005
+      - DB_PATH=/app/data/scraper.db
+      - LOG_LEVEL=info
+      - GEMMA_BASE_URL=http://host.docker.internal:11434/v1
+      - GEMMA_API_KEY=ollama
+      - GEMMA_MODEL=gemma4:e4b
+      - OLLAMA_KEEP_ALIVE=5m
+    depends_on:
+      - matcher
+    restart: unless-stopped
+
+  scorer:
+    build:
+      context: .
+      dockerfile: services/scorer/Dockerfile
+    ports:
+      - "3006:3006"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3006
+      - DB_PATH=/app/data/scraper.db
+      - LOG_LEVEL=info
+    depends_on:
+      - validator
+    restart: unless-stopped
