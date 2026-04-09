@@ -8,3 +8,7 @@ data/vectors/
 dist/
 build/
 *.log
+services/**/.env
+services/**/.env.*
+services/**/dist/
+services/**/data/
