@@ -18,29 +18,29 @@ Each skill dimension is a **SkillSet** object with `required` and `preferred` ar
 ```json
 {
   "source_type": "job_posting | cv",
-  "domain_knowledge":      { "required": ["string"], "preferred": ["string"] },
+  "domain_knowledge": { "required": ["string"], "preferred": ["string"] },
   "programming_languages": { "required": ["string"], "preferred": ["string"] },
-  "tools":                 { "required": ["string"], "preferred": ["string"] },
-  "infrastructure":        { "required": ["string"], "preferred": ["string"] },
-  "project_management":    { "required": ["string"], "preferred": ["string"] },
-  "spoken_languages":      { "required": ["string"], "preferred": ["string"] },
-  "soft_skills":           { "required": ["string"], "preferred": ["string"] },
+  "tools": { "required": ["string"], "preferred": ["string"] },
+  "infrastructure": { "required": ["string"], "preferred": ["string"] },
+  "project_management": { "required": ["string"], "preferred": ["string"] },
+  "spoken_languages": { "required": ["string"], "preferred": ["string"] },
+  "soft_skills": { "required": ["string"], "preferred": ["string"] },
   "experience_level": "junior | mid | senior | lead | null"
 }
 ```
 
 ## Field Definitions
 
-| Field | What belongs here | Examples |
-|-------|------------------|---------|
-| `domain_knowledge` | Technical knowledge areas (concepts, not tools) | "Build Pipelines", "CI/CD", "Compilation", "Machine Learning", "REST API Design" |
-| `programming_languages` | Programming and scripting languages | "C++", "Python", "TypeScript", "SQL", "PowerShell", "Bash" |
-| `tools` | Dev tools, IDEs, frameworks, libraries | "React", "Vue", "Angular", "MSBuild", "Visual Studio", "PyTorch", "Jest", "SCons", "Conan" |
-| `infrastructure` | Cloud providers, CI/CD systems, containers, orchestration | "AWS", "Azure", "GCP", "Jenkins", "GitHub Actions", "Azure DevOps", "Docker", "Kubernetes", "Terraform" |
-| `project_management` | PM tools and methodologies | "Jira", "Confluence", "Scrum", "Kanban", "Agile", "SAFe" |
-| `spoken_languages` | Human spoken/written languages only | "English", "German", "French" |
-| `soft_skills` | Interpersonal and organizational skills | "Communication", "Team Leadership", "Mentoring" |
-| `experience_level` | Seniority level inferred from context | "junior" \| "mid" \| "senior" \| "lead" \| null |
+| Field                   | What belongs here                                         | Examples                                                                                                |
+| ----------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `domain_knowledge`      | Technical knowledge areas (concepts, not tools)           | "Build Pipelines", "CI/CD", "Compilation", "Machine Learning", "REST API Design"                        |
+| `programming_languages` | Programming and scripting languages                       | "C++", "Python", "TypeScript", "SQL", "PowerShell", "Bash"                                              |
+| `tools`                 | Dev tools, IDEs, frameworks, libraries                    | "React", "Vue", "Angular", "MSBuild", "Visual Studio", "PyTorch", "Jest", "SCons", "Conan"              |
+| `infrastructure`        | Cloud providers, CI/CD systems, containers, orchestration | "AWS", "Azure", "GCP", "Jenkins", "GitHub Actions", "Azure DevOps", "Docker", "Kubernetes", "Terraform" |
+| `project_management`    | PM tools and methodologies                                | "Jira", "Confluence", "Scrum", "Kanban", "Agile", "SAFe"                                                |
+| `spoken_languages`      | Human spoken/written languages only                       | "English", "German", "French"                                                                           |
+| `soft_skills`           | Interpersonal and organizational skills                   | "Communication", "Team Leadership", "Mentoring"                                                         |
+| `experience_level`      | Seniority level inferred from context                     | "junior" \| "mid" \| "senior" \| "lead" \| null                                                         |
 
 ## Category Boundaries
 
@@ -51,10 +51,10 @@ Each skill dimension is a **SkillSet** object with `required` and `preferred` ar
 
 ## Required vs Preferred
 
-| Context | `required` | `preferred` |
-|---------|-----------|------------|
+| Context          | `required`                               | `preferred`                                                          |
+| ---------------- | ---------------------------------------- | -------------------------------------------------------------------- |
 | **Job postings** | Mandatory, "solid experience", essential | "nice to have", "helpful", "a plus", "preferred", "would be helpful" |
-| **CVs** | Clearly demonstrated skills | Briefly mentioned, basic exposure only |
+| **CVs**          | Clearly demonstrated skills              | Briefly mentioned, basic exposure only                               |
 
 ## Notes
 
@@ -64,23 +64,49 @@ Each skill dimension is a **SkillSet** object with `required` and `preferred` ar
 - `experience_level` is inferred from context ("5+ years" → senior, "entry-level" → junior). Set to `null` if not determinable.
 - Do not duplicate items across categories.
 
+## CV Entry Point
+
+CVs enter the pipeline via a dedicated endpoint — they do **not** use `/extract`.
+
+```
+POST /extract-cv
+Body: { cv_id: string, text: string }
+→ ExtractionResult (synchronous, idempotent)
+```
+
+- `cv_id` is the caller-assigned identifier for the CV. It is stored in the `posting_id` column of `extracted_skills` with `source_type = 'cv'` (see shared-table pattern in CLAUDE.md).
+- The endpoint bypasses the `job_postings` table entirely — there is no `claimSingle`/`markDone` lifecycle. The result is written directly via `insertCvExtraction()` with `embedding_status = 'pending'`.
+- The embedder picks up the row automatically on its next poll or `POST /process-pending` call.
+- Idempotent: if a row for `cv_id` already exists in `extracted_skills`, the existing result is returned without re-extracting.
+
 ## API Endpoints
 
 Service port: **3002**
 
-| Method | Path | Body / Query | Response |
-| ------ | ---- | ------------ | -------- |
-| `GET`  | `/health` | — | `{ status: 'ok' }` |
-| `POST` | `/extract` | `{ posting_id: string }` | `ExtractionResult` — synchronous, blocks until extraction is complete |
-| `POST` | `/process-pending` | `{ limit?: number }` (default 50, max 200) | `{ claimed: number, message: string }` — responds immediately, processes in background |
-| `GET`  | `/extractions` | `?limit=&offset=` | `ExtractionRow[]` — paginated list of all extraction results |
-| `GET`  | `/extractions/:posting_id` | — | `ExtractionRow` or 404 |
+| Method | Path                       | Body / Query                               | Response                                                                               |
+| ------ | -------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `GET`  | `/health`                  | —                                          | `{ status: 'ok' }`                                                                     |
+| `POST` | `/extract`                 | `{ posting_id: string }`                   | `ExtractionResult` — synchronous, for job postings only                                |
+| `POST` | `/extract-cv`              | `{ cv_id: string, text: string }`          | `ExtractionResult` — synchronous, for CVs; idempotent                                  |
+| `POST` | `/process-pending`         | `{ limit?: number }` (default 50, max 200) | `{ claimed: number, message: string }` — responds immediately, processes in background |
+| `GET`  | `/extractions`             | `?limit=&offset=`                          | `ExtractionRow[]` — paginated list of all extraction results                           |
+| `GET`  | `/extractions/:posting_id` | —                                          | `ExtractionRow` or 404 (works for both job postings and CVs by their id)               |
+
 ### POST /extract — notes
+
 - Returns 409 if the posting is not in `pending` state (already processing, done, or errored).
 - Returns 404 if the `posting_id` does not exist in `job_postings`.
 - Marks the posting as `processing` before calling the LLM; marks `done` or `error` after.
 
+### POST /extract-cv — notes
+
+- Does not touch `job_postings`. No state machine — write succeeds or fails.
+- Returns 400 if `cv_id` or `text` is missing/empty.
+- Returns the cached `ExtractionRow` (200) if `cv_id` is already in `extracted_skills`.
+
 ### POST /process-pending — notes
+
 - Claims up to `limit` pending postings atomically (no race conditions with concurrent calls).
+- Only processes job postings (reads from `job_postings` table). CVs are submitted on-demand via `/extract-cv`.
 - Processes in background after the HTTP response is sent.
 - `claimed` is the number of postings started — not the number successfully completed.
