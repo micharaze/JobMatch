@@ -187,6 +187,36 @@ class ExtractorDb {
     return row ? deserialize(row) : undefined;
   }
 
+  /**
+   * Insert an extraction result for a CV directly (no corresponding job_postings row).
+   * Used by the /extract-cv endpoint. Sets embedding_status to 'pending' so the
+   * embedder picks it up automatically.
+   */
+  insertCvExtraction(cvId: string, result: ExtractionResult): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO extracted_skills
+           (posting_id, source_type,
+            domain_knowledge, programming_languages, spoken_languages,
+            tools, infrastructure, project_management, soft_skills,
+            experience_level, extracted_at, embedding_status)
+         VALUES (?, 'cv', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      )
+      .run(
+        cvId,
+        JSON.stringify(result.domain_knowledge),
+        JSON.stringify(result.programming_languages),
+        JSON.stringify(result.spoken_languages),
+        JSON.stringify(result.tools),
+        JSON.stringify(result.infrastructure),
+        JSON.stringify(result.project_management),
+        JSON.stringify(result.soft_skills),
+        result.experience_level ?? null,
+        now,
+      );
+  }
+
   close(): void {
     this.db.close();
   }

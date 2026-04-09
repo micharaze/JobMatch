@@ -114,3 +114,20 @@ services:
     depends_on:
       - validator
     restart: unless-stopped
+
+  cv:
+    build:
+      context: .
+      dockerfile: services/cv/Dockerfile
+    ports:
+      - "3007:3007"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3007
+      - DB_PATH=/app/data/scraper.db
+      - LOG_LEVEL=info
+      - EXTRACTOR_URL=http://extractor:3002
+    depends_on:
+      - extractor
+    restart: unless-stopped

@@ -110,3 +110,41 @@ router.get('/extractions/:posting_id', (req: Request, res: Response): void => {
   res.json(row);
 });
 
+// ── POST /extract-cv ──────────────────────────────────────────────────────────
+// Called by the CV service after a CV is uploaded and text is parsed.
+// Takes raw CV text, runs extraction, and writes to extracted_skills so the
+// embedder can pick it up automatically.
+
+const ExtractCvBodySchema = z.object({
+  cv_id: z.string().min(1),
+  text:  z.string().min(1),
+});
+
+router.post('/extract-cv', async (req: Request, res: Response): Promise<void> => {
+  const parsed = ExtractCvBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.flatten() });
+    return;
+  }
+
+  const { cv_id, text } = parsed.data;
+
+  // Idempotency: if already extracted, return the existing result
+  const existing = db.findExtractionByPostingId(cv_id);
+  if (existing) {
+    res.json(existing);
+    return;
+  }
+
+  try {
+    const result = await extractSkills(text, 'cv');
+    db.insertCvExtraction(cv_id, result);
+    logger.info('CV extraction complete', { cv_id });
+    res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn('CV extraction failed', { cv_id, error: message });
+    res.status(500).json({ error: 'Extraction failed', detail: message });
+  }
+});
+
