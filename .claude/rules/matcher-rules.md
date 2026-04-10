@@ -1,117 +1,113 @@
-# Matcher — Vector Similarity Retrieval
+# Matcher — LLM-Based CV-to-Job Scoring
 
 Relevant for: `services/matcher/`
 
-Source of truth: `shared/config/matching.ts` — thresholds defined there, never hardcoded in service logic.
+Source of truth: `services/matcher/src/llm/matcher.ts` — the system prompt and scoring rules there are authoritative.
 
-## Rule
+## Purpose
 
-The matcher retrieves the top-k most similar CV skills for each job skill using LanceDB vector
-search. It acts as a fast pre-filter before the validator (Step 5). Only candidates that pass
-the dimension-specific similarity threshold are forwarded.
+The matcher performs a single LLM call per (job posting, CV) pair and produces a structured score with reasoning. It replaces the old 3-service chain (matcher → validator → scorer) with one direct LLM judgement.
 
-## Why a Pre-Filter?
+**Why LLM instead of embeddings?**
+- Embeddings are semantically blind to domain context: React and Angular are "close" vectors, but NOT interchangeable in recruiting. C and Go are similar vectors but distinct skills.
+- LLMs understand skill relationships natively — no threshold calibration required.
+- For a single-CV use case, the scale advantage of vector search doesn't apply.
 
-Comparing every job skill against every CV skill via LLM would require millions of calls for
-any realistic dataset. The matcher reduces this to a manageable set of plausible candidates
-cheaply and in milliseconds. The validator then makes the precise judgement.
+## Input
 
-## Asymmetric Query Encoding
-
-At retrieval time, job skills are encoded as queries — NOT as documents:
-
-```typescript
-function encodeQuery(skill: string): string {
-  return `query: ${skill}`;
-}
-```
-
-CV skills were stored as `passage: {skill}` by the embedder. Using `query: ` here is
-mandatory — see `embedding-rules.md` for the full asymmetric encoding contract.
-
-## Dimension-Specific Similarity Thresholds
-
-Vector similarity is semantically blind to dimension context. React and Angular are "close"
-in the vector space (both JS frontend frameworks), but are NOT interchangeable in recruiting.
-C and Go are similar vectors but distinct skills.
-
-Each dimension has its own minimum cosine similarity threshold. Skills below the threshold
-are dropped and never sent to the validator.
-
-| Dimension               | Min. Cosine Similarity | Rationale                                       |
-| ----------------------- | ---------------------- | ----------------------------------------------- |
-| `programming_languages` | **0.92**               | Strict — C ≠ Go, Python ≠ Ruby                  |
-| `tools`                 | **0.90**               | Strict — React ≠ Angular, MSBuild ≠ Gradle      |
-| `infrastructure`        | **0.88**               | Strict-ish — AWS ≠ GCP, but Docker ≈ Podman ok  |
-| `project_management`    | **0.85**               | Medium — Jira ≈ YouTrack, Scrum ≈ Kanban ok      |
-| `domain_knowledge`      | **0.82**               | Medium — conceptual overlap is acceptable        |
-| `spoken_languages`      | **0.95**               | Very strict — English ≠ German, always           |
-| `soft_skills`           | **0.75**               | Loose — "Communication" ≈ "Collaboration" ok     |
-
-All thresholds live in `shared/config/matching.ts` as a typed constant — import from there.
-
-## Top-k Per Dimension
-
-Return at most **5 candidates per job skill** to the validator. This keeps validator input
-short and focused. Configurable via `MATCHER_TOP_K` env var (default: 5).
+Reads `normalized_text` directly from `job_postings` and `cvs` tables (only pairs where both `normalization_status = 'done'`). Never reads raw descriptions — the normalizer caches the compact profiles once per document.
 
 ## Output Schema
 
-The matcher returns a list of candidates per job skill, preserving dimension and priority
-metadata so the validator and scorer can use them:
-
 ```typescript
-interface MatchCandidate {
-  job_skill:   string;
-  cv_skill:    string;
-  dimension:   string;
-  priority:    'required' | 'preferred';
-  score:       number;   // cosine similarity [0.0, 1.0]
-  cv_point_id: string;   // Qdrant point ID of the CV skill
-  posting_id:  string;   // which job posting this comes from
-  cv_id:       string;   // which CV this candidate belongs to
+interface MatchResult {
+  posting_id:      string;
+  cv_id:           string;
+  score:           number;    // 0–100 integer
+  summary:         string;    // 2–3 sentence assessment
+  matched_skills:  string[];
+  missing_skills:  string[];
+  adjacent_skills: string[];  // e.g. "Vue.js → Angular: related but different framework"
+  model:           string;
+  matched_at:      string;
 }
 ```
 
-Source of truth: `shared/schemas/matching.ts`
+Source of truth: `shared/schemas/match-result.ts`
 
-## LanceDB Filter
+## Scoring Rules
 
-Always filter by `source_type = 'cv'` when searching for CV candidates. Job skills must
-never match against other job skills.
+These rules are enforced via the system prompt — see `services/matcher/src/llm/matcher.ts` for the authoritative text.
 
-```typescript
-table
-  .vectorSearch(queryVector)
-  .where(`source_type = 'cv' AND dimension = '${dimension}'`)
-  .distanceType('cosine')
-  .limit(topK)
-  .toArray();
+- **Score 70+** only if the candidate meets most required skills AND those skills are **current/active**.
+- Skills in the CV's **"Past"** bucket (older positions) count at **half weight** — treat as background knowledge, not active proficiency.
+- **Strict skill identity**: React ≠ Angular, Vue.js ≠ Angular, Python ≠ Java. These are never matched.
+- **Adjacent ≠ matched**: A skill that is related but not the same goes in `adjacent_skills`, not `matched_skills`. Example: `"Vue.js → Angular: similar component model, not directly transferable"`.
+- **Domain context bonus**: Up to 10 points if the CV shows deep experience matching the job's project context (e.g. same industry, same project type, same team scale).
+- **Score bands**:
+  - 0–40: significant skill gaps
+  - 41–65: partial match
+  - 66–80: solid match
+  - 81–100: strong match
+
+## LLM Call
+
+- `response_format: { type: 'json_object' }` — primary attempt.
+- Fallback: retry once without `response_format`, with an explicit JSON instruction appended to the prompt.
+- Strip markdown code fences (` ```json ... ``` `) before `JSON.parse`.
+- Temperature: `0.1` — deterministic output.
+- Validate output: `score` must be 0–100 integer, `summary` non-empty, all skill arrays present. Throw if invalid — the caller marks `error` and the pair will be retried by `process-pending`.
+
+## DB Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS match_results (
+  id              INTEGER PRIMARY KEY,
+  posting_id      TEXT NOT NULL,
+  cv_id           TEXT NOT NULL,
+  score           INTEGER NOT NULL,
+  summary         TEXT NOT NULL,
+  matched_skills  TEXT NOT NULL DEFAULT '[]',
+  missing_skills  TEXT NOT NULL DEFAULT '[]',
+  adjacent_skills TEXT NOT NULL DEFAULT '[]',
+  model           TEXT NOT NULL,
+  matched_at      TEXT NOT NULL,
+  UNIQUE(posting_id, cv_id)
+);
+CREATE INDEX IF NOT EXISTS idx_match_results_posting ON match_results(posting_id, score DESC);
 ```
 
-Filtering by dimension in the query (not just in application code) keeps the search space
-small and avoids cross-dimension false positives (e.g. "Python" tool vs "Python" language).
+`matched_skills`, `missing_skills`, and `adjacent_skills` are stored as JSON arrays.
 
-Vector data is stored in `data/vectors/` as files — no server process needed. LanceDB runs
-fully embedded inside the service process, identical to how SQLite works for relational data.
+## Pending Pair Discovery
+
+`process-pending` finds all normalized pairs that have no match result yet:
+
+```sql
+SELECT jp.id AS posting_id, c.id AS cv_id
+FROM job_postings jp
+CROSS JOIN cvs c
+LEFT JOIN match_results mr ON mr.posting_id = jp.id AND mr.cv_id = c.id
+WHERE jp.normalization_status = 'done'
+  AND c.normalization_status  = 'done'
+  AND mr.id IS NULL
+```
 
 ## API Endpoints
 
 Service port: **3004**
 
 | Method | Path | Body / Query | Response |
-| ------ | ---- | ------------ | -------- |
+|--------|------|--------------|----------|
 | `GET`  | `/health` | — | `{ status: 'ok' }` |
-| `POST` | `/match` | `{ posting_id: string, cv_ids?: string[] }` | `{ ok, posting_id, cv_ids, message }` — responds immediately, processes in background |
-| `GET`  | `/matches` | `?posting_id=&cv_id=&limit=&offset=` | `MatchCandidate[]` sorted by score desc |
-| `GET`  | `/matches/:posting_id/:cv_id` | — | `{ posting_id, cv_id, count, candidates: MatchCandidate[] }` or 404 |
-| `GET`  | `/status` | — | `{ pending, processing, done, error }` run counts |
+| `POST` | `/match` | `{ posting_id, cv_id? }` | `{ ok, posting_id, cv_id, message }` — responds immediately, processes in background |
+| `POST` | `/process-pending` | `{ limit? }` | `{ started, message }` — matches all unmatched normalized pairs; background |
+| `GET`  | `/matches` | `?posting_id=&cv_id=&limit=&offset=` | `MatchResult[]` sorted by score DESC |
+| `GET`  | `/matches/:posting_id` | — | `MatchResult[]` for all CVs matched against this posting, ranked |
+| `GET`  | `/matches/:posting_id/:cv_id` | — | `MatchResult` or 404 |
 
-### POST /match — notes
-- If `cv_ids` is omitted, matches against **all** CVs with `embedding_status = 'done'`.
-- Runs are idempotent: already-done pairs are skipped; errored pairs are retried.
-- Results are stored in SQLite (`match_candidates` table) for the validator to consume.
+### Notes
 
-### Match result persistence
-- `match_runs` table — tracks `(posting_id, cv_id)` pair status: `pending | processing | done | error`
-- `match_candidates` table — stores `MatchCandidate` rows (indexed on `posting_id, cv_id`)
+- `POST /match` without `cv_id` matches the posting against **all** normalized CVs.
+- Results are upserted (`INSERT OR REPLACE`) — re-running a match overwrites the previous result.
+- `POST /process-pending` is the normal trigger after normalizing a batch of postings.

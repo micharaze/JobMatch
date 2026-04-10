@@ -50,6 +50,5 @@ If a page cannot be scraped via a normal HTTP request (fetch/axios) — e.g. due
 
 ## What NOT to do
 
-- Do not extract skills in the scraper — that is step 2 (extractor).
-- Do not embed or vectorize anything — that is step 3 (embedder).
+- Do not normalize or summarize job descriptions in the scraper — that is step 2 (normalizer).
 - Do not store raw HTML in production unless explicitly configured for debugging.

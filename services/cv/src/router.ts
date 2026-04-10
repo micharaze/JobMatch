@@ -8,7 +8,7 @@ import logger from './logger';
 
 export const router = Router();
 
-const EXTRACTOR_URL = process.env.EXTRACTOR_URL ?? 'http://localhost:3002';
+const NORMALIZER_URL = process.env.NORMALIZER_URL ?? 'http://localhost:3002';
 
 // Store uploads in memory — CVs are typically < 1MB
 const upload = multer({
@@ -69,24 +69,24 @@ router.post('/cvs', upload.single('file'), async (req: Request, res: Response): 
     uploaded_at:       uploadedAt,
   });
 
-  // Trigger extraction asynchronously after response is sent
-  triggerExtraction(cvId, text);
+  // Trigger normalization asynchronously after response is sent
+  triggerNormalization(cvId);
 });
 
-async function triggerExtraction(cvId: string, text: string): Promise<void> {
+async function triggerNormalization(cvId: string): Promise<void> {
   db.markProcessing(cvId);
   try {
     await axios.post(
-      `${EXTRACTOR_URL}/extract-cv`,
-      { cv_id: cvId, text },
+      `${NORMALIZER_URL}/normalize-cv`,
+      { cv_id: cvId },
       { timeout: 120_000 },
     );
     db.markDone(cvId);
-    logger.info('CV extraction complete', { cv_id: cvId });
+    logger.info('CV normalization complete', { cv_id: cvId });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     db.markError(cvId, message);
-    logger.warn('CV extraction failed', { cv_id: cvId, error: message });
+    logger.warn('CV normalization failed', { cv_id: cvId, error: message });
   }
 }
 

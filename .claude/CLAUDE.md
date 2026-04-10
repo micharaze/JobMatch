@@ -2,67 +2,66 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**Status: Backend services implemented** — `scraper`, `extractor`, `embedder`, `matcher`, `validator`, and `scorer` are all running. The `ui/` service (React frontend + CV upload API) is not yet implemented.
+**Status: Backend services implemented** — `scraper`, `normalizer`, `matcher`, and `cv` are running. The `ui/` service (React frontend) is not yet implemented.
 
 ## Project: JobMatch — Recruiting Matcher
 
-A pipeline-based recruiting system that matches job postings to CVs via AI-powered skill extraction and semantic search. Each pipeline stage is an independent **Node.js + TypeScript** service. The frontend is **React + TypeScript**.
+A pipeline-based recruiting system that matches job postings to a CV using LLM-based normalization and scoring. Each pipeline stage is an independent **Node.js + TypeScript** service.
 
 ### Pipeline Architecture
 
 ```
-Job Postings (scraped)              CVs (POST /extract-cv)
+Job Postings (scraped)              CV (POST /cvs — file upload)
        │                                    │
-       ▼                                    │  ← CVs skip step 1;
-[1] Scraper Service                         │    enter at step 2 directly
-       │  fetches & normalizes              │    with { cv_id, text }
-       │  job postings                      │
        ▼                                    ▼
-[2] Skill Extractor  ←  Gemma 4 E4B extracts structured skills
-       │                 from BOTH; source_type = 'job_posting' | 'cv'
-       │                 writes to extracted_skills (embedding_status='pending')
+[1] Scraper Service                  CV Service (port 3007)
+       │  fetches & stores                  │  parses PDF/DOCX/TXT
+       │  job postings                      │  stores raw text in cvs table
+       │                                    │  calls POST /normalize-cv
+       ▼                                    ▼
+[2] Normalizer Service  ←─────────────────────
+       │  Compresses verbose job posting descriptions and CV text
+       │  into compact structured markdown profiles (~250 tokens).
+       │  Strips boilerplate; preserves requirements + project context.
+       │  For CVs: groups skills by recency (Active / Solid / Past).
+       │  Writes normalized_text + normalization_status to job_postings / cvs tables.
+       │  Runs once per document and caches the result.
        ▼
-[3] Embedding Service ← EmbeddingGemma encodes all extracted
-       │                 skills → LanceDB (asymmetric formatting)
-       │                 picks up all rows with embedding_status='pending'
+[3] Matcher Service  (port 3004)
+       │  Single LLM call per (posting, CV) pair.
+       │  Reads normalized_text from both tables.
+       │  Produces: score 0–100, summary, matched/missing/adjacent skills.
+       │  Stores results in match_results table.
        ▼
-[4] Matcher / Retrieval Service
-       │  finds nearest CV skills for each job skill
-       │  via vector similarity (filters source_type='cv')
-       ▼
-[5] Validation / Rerank Service
-       │  Gemma 4 E4B checks top candidates via function calling,
-       │  labels exact / semantic / uncertain, adds reasoning
-       ▼
-[6] Scoring Service
-       │  deterministic weighted scoring of validated matches
-       ▼
-[7] UI / API Service  (not yet implemented)
-       React + TypeScript frontend + API gateway;
-       will expose CV upload endpoint and manual DB management
+[4] UI / API Service  (not yet implemented)
+       React + TypeScript frontend;
+       displays ranked job postings with scores and reasoning.
 ```
 
-**Important**: CVs must pass through steps 2 and 3 (extraction + embedding) before any matching in step 4 is valid. The extractor produces the same structured skill schema for both job postings and CVs.
+**Important design decisions:**
 
-### Model Responsibility Split
+- **No vector embeddings.** The old embedding-based pipeline (embedder, LanceDB, vector similarity, validator, scorer) has been removed. LLMs understand skill relationships better than cosine similarity — React ≠ Angular, but C ≈ C++ — without any threshold calibration.
+- **Normalize once, match many.** Normalization is expensive (LLM call) but happens once per document. Matching re-reads the cached `normalized_text`. Adding a new CV or posting only requires normalizing that one document.
+- **Temporal skill context.** CV normalization groups skills into Active / Solid / Past buckets using work history dates. The matcher uses this to weight recent skills higher than historical ones.
 
-| Model              | Role                                                                          |
-| ------------------ | ----------------------------------------------------------------------------- |
-| **Gemma 4 E4B**    | Extraction from job postings AND CVs, validation/reranking — steps 2 and 5    |
-| **EmbeddingGemma** | Semantic similarity — steps 3 and 4 (asymmetric query-vs-document formatting) |
+### LLM Usage
 
-The vector index handles candidate retrieval in step 4; Gemma 4 only sees the top-k results and validates them — it does not search the vector space directly.
+Both normalizer and matcher use the same model. Supported backends:
+
+| Provider | Config | Notes |
+|----------|--------|-------|
+| Ollama (local) | `LLM_PROVIDER=ollama`, `GEMMA_BASE_URL`, `GEMMA_MODEL` | Default. Private, no API cost. |
+| Gemini API | `LLM_PROVIDER=gemini`, `GEMINI_API_KEY`, `GEMINI_MODEL` | Cloud. Better quality at small cost. |
+
+Model is set independently per service via `NORMALIZER_MODEL` and `MATCHER_MODEL` env vars (fall back to `GEMMA_MODEL` / `GEMINI_MODEL`).
 
 See `.claude/rules/` for specific rules — load only what is relevant to the current service:
 
-| Rule file              | When to load            |
-| ---------------------- | ----------------------- |
-| `scraper-rules.md`     | Working in `scraper/`   |
-| `extraction-schema.md` | Working in `extractor/` |
-| `embedding-rules.md`   | Working in `embedder/`  |
-| `matcher-rules.md`     | Working in `matcher/`   |
-| `validation-rules.md`  | Working in `validator/` |
-| `scoring-rules.md`     | Working in `scorer/`    |
+| Rule file              | When to load              |
+| ---------------------- | ------------------------- |
+| `scraper-rules.md`     | Working in `scraper/`     |
+| `normalizer-rules.md`  | Working in `normalizer/`  |
+| `matcher-rules.md`     | Working in `matcher/`     |
 
 ## Commands
 
@@ -77,41 +76,69 @@ docker compose up
 cd services/<service-name>
 npm run dev
 
+# TypeScript compile check (no emit)
+cd services/<service-name>
+npx tsc --noEmit
+
 # Run tests for a service
 cd services/<service-name>
 npm test
 
 # Run all tests from root
 npm test
-
-# Lint / format
-npm run lint
-npm run format
 ```
 
 ## Service Layout
 
 ```
 services/
-  scraper/      # Job posting fetcher + normalizer
-  extractor/    # Gemma 4 E4B skill extraction (job postings AND CVs)
-  embedder/     # EmbeddingGemma encoding + vector DB writes
-  matcher/      # Vector similarity retrieval
-  validator/    # Gemma 4 E4B reranking and label assignment via function calling
-  scorer/       # Deterministic weighted scoring
-  cv/           # CV upload, text parsing, and extraction trigger (port 3007)
-  ui/           # React + TypeScript frontend + API gateway — NOT YET IMPLEMENTED
-shared/         # TypeScript types/interfaces, Zod schemas, LLM client abstractions, DB clients
+  scraper/      # Job posting fetcher (port 3001)
+  normalizer/   # LLM normalization of job postings and CVs (port 3002)
+  matcher/      # LLM-based CV-to-job scoring (port 3004)
+  cv/           # CV file upload, text parsing, normalization trigger (port 3007)
+  ui/           # React + TypeScript frontend — NOT YET IMPLEMENTED
+shared/         # TypeScript types, Zod schemas, LLM client pattern, skill aliases
+```
+
+## Database
+
+Single SQLite file at `data/scraper.db`, shared across all services via Docker volume `./data:/app/data`.
+
+All services open with `PRAGMA journal_mode = WAL` to allow concurrent reads.
+
+**Key tables:**
+
+| Table | Written by | Read by |
+|-------|-----------|---------|
+| `job_postings` | scraper | normalizer, matcher |
+| `cvs` | cv service | normalizer, matcher |
+| `match_results` | matcher | ui (future) |
+
+**Columns added by normalizer** (via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`):
+- `job_postings.normalized_text TEXT`
+- `job_postings.normalization_status TEXT` — `pending | processing | done | error`
+- `cvs.normalized_text TEXT`
+- `cvs.normalization_status TEXT` — `pending | processing | done | error`
+
+**No separate `cv_id` column anywhere.** CVs are identified by their `id` in the `cvs` table (format: `cv:<uuid>`). `match_results` uses `posting_id` and `cv_id` as a composite key.
+
+## Shared Package
+
+`shared/` exports:
+- `shared/schemas/job-posting.ts` — `JobPosting` type
+- `shared/schemas/match-result.ts` — `MatchResult` interface (score, summary, matched/missing/adjacent skills)
+- `shared/config/skill-aliases.ts` — canonical skill name map (e.g. "Apache Kafka" → "Kafka")
+
+After editing `shared/`, always rebuild before type-checking a service:
+```bash
+npm run build -w @jobcheck/shared
 ```
 
 ## Conventions
 
-- **Language**: All backend services use Node.js + TypeScript. The frontend uses React + TypeScript. All code — variable names, comments, commit messages, and documentation — must be written in English.
-- **i18n**: The application is designed for multi-language support. For now, only English is implemented. Use a localization framework (e.g. `i18next`) from the start so adding more languages later requires no structural changes. Keep all user-facing strings in translation files, never hardcode them in components or services.
-- Each service is independently runnable and testable — no service imports from another service's directory.
-- All TypeScript types, Zod validation schemas, LLM client wrappers, and DB clients live in `shared/` and are imported by all services.
-- Gemma model connections are initialized once at service startup, not per-request.
-- Both job skills and CV skills must be extracted (step 2) and embedded (step 3) before retrieval in step 4 is valid.
-- CVs follow the same extraction pipeline as job postings — the extractor handles both input types.
-- **Shared-table pattern**: All pipeline tables (`extracted_skills`, `match_candidates`, `match_runs`, `validation_runs`, `validated_matches`, `scores`) use a single `posting_id` column that doubles as `cv_id` for CVs. Rows are discriminated by `source_type = 'job_posting' | 'cv'`. Never add a separate `cv_id` column — use this convention instead.
-- **CV entry point**: CVs are submitted to the CV service (`POST :3007/cvs`, multipart). The CV service parses the file, stores metadata in `cvs`, and calls `POST :3002/extract-cv` with `{ cv_id, text }`. The embedder and all downstream services pick them up automatically once `embedding_status = 'done'`.
+- **Language**: All code, comments, commit messages, and documentation must be in English.
+- Each service is independently runnable — no service imports from another service's directory.
+- All shared types and DB clients live in `shared/` and are imported via `@jobcheck/shared`.
+- LLM client (`llm/client.ts`) is instantiated once per service process, not per request.
+- **CV entry point**: CVs are submitted via `POST :3007/cvs` (multipart, field name `file`). The CV service parses the file, stores it in `cvs`, then calls `POST :3002/normalize-cv` with `{ cv_id }`. The normalizer reads the text from the DB itself.
+- **Do not add `extraction_status`, `embedding_status`, or any column from the old pipeline** — those tables and columns no longer exist.

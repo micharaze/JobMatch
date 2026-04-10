@@ -33,6 +33,7 @@ WORKDIR /app
 
 # Copy workspace files
 COPY package*.json ./
+COPY tsconfig.base.json ./
 COPY shared/ ./shared/
 COPY services/scraper/ ./services/scraper/
 

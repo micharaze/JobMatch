@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  JobCheck — Interactive Installer
-#  Sets up Ollama and pulls the AI models required for the pipeline.
+#  Sets up the LLM backend (Ollama or Gemini API) and pulls the AI models
+#  required for the pipeline.
 # =============================================================================
 
 set -euo pipefail
@@ -74,6 +75,13 @@ ask_choice() {
   done
 }
 
+ask_text() {
+  # ask_text "prompt" → sets TEXT_INPUT
+  local prompt="$1"
+  echo -en "  ${BOLD}$prompt${NC} "
+  read -r TEXT_INPUT
+}
+
 # ── System detection ──────────────────────────────────────────────────────────
 detect_os() {
   case "$(uname -s)" in
@@ -134,19 +142,8 @@ ensure_ollama_running() {
   fi
 }
 
-# ── Model definitions ─────────────────────────────────────────────────────────
+# ── Model table display ───────────────────────────────────────────────────────
 # Format: "id|display_name|size_gb|min_ram_gb|description"
-EXTRACT_MODELS=(
-  "gemma4:e4b|gemma4:e4b  (4B params)|~3.5 GB|8 GB |★ Recommended — best accuracy for skill extraction"
-  "gemma4:e2b|gemma4:e2b  (2B params)|~2.0 GB|4 GB |Lighter option — slightly lower accuracy, faster"
-)
-
-EMBED_MODELS=(
-  "embeddinggemma    |embeddinggemma (300M)|~622 MB|2 GB |★ Recommended — Google Gemma family, built for retrieval & semantic similarity, 100+ languages"
-  "mxbai-embed-large |mxbai-embed-large   |~670 MB|2 GB |Top MTEB retrieval score — purpose-built for query/passage asymmetric search"
-  "nomic-embed-text  |nomic-embed-text    |~274 MB|1 GB |Lightweight — good quality, smallest footprint"
-)
-
 parse_model_id()   { echo "$1" | cut -d'|' -f1 | tr -d ' '; }
 parse_model_name() { echo "$1" | cut -d'|' -f2; }
 parse_model_size() { echo "$1" | cut -d'|' -f3; }
@@ -159,8 +156,8 @@ show_model_table() {
   echo ""
   echo -e "  ${BOLD}$title${NC}"
   echo ""
-  printf "  %-3s %-22s %-10s %-8s %s\n" "#" "Model" "Download" "Min RAM" "Notes"
-  echo -e "  ${DIM}$(printf '%.0s─' {1..72})${NC}"
+  printf "  %-3s %-26s %-10s %-8s %s\n" "#" "Model" "Download" "Min RAM" "Notes"
+  echo -e "  ${DIM}$(printf '%.0s─' {1..76})${NC}"
   local i=1
   for m in "${models[@]}"; do
     local name size ram desc
@@ -168,7 +165,7 @@ show_model_table() {
     size=$(parse_model_size "$m")
     ram=$(parse_model_ram "$m")
     desc=$(parse_model_desc "$m")
-    printf "  ${BOLD}%-3s${NC} %-22s ${CYAN}%-10s${NC} ${YELLOW}%-8s${NC} ${DIM}%s${NC}\n" \
+    printf "  ${BOLD}%-3s${NC} %-26s ${CYAN}%-10s${NC} ${YELLOW}%-8s${NC} ${DIM}%s${NC}\n" \
       "[$i]" "$name" "$size" "$ram" "$desc"
     ((i++))
   done
@@ -176,41 +173,63 @@ show_model_table() {
 
 # ── .env writer ───────────────────────────────────────────────────────────────
 write_env() {
-  local extract_model="$1"
-  local embed_model="$2"
-  local env_file="services/extractor/.env"
+  local provider="$1"
+  local llm_model="$2"
+  local gemini_api_key="${3:-}"
 
-  mkdir -p services/extractor
+  mkdir -p services/normalizer services/matcher
 
-  cat > "$env_file" <<EOF
-# ── Ollama / LLM settings ─────────────────────────────────────────────────────
+  if [[ "$provider" == "gemini" ]]; then
+    # ── Gemini provider ───────────────────────────────────────────────────────
+    local llm_block
+    llm_block=$(cat <<EOF
+# ── LLM provider ─────────────────────────────────────────────────────────────
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=${gemini_api_key}
+NORMALIZER_MODEL=${llm_model}
+MATCHER_MODEL=${llm_model}
+EOF
+)
+    echo "$llm_block" > services/normalizer/.env
+    echo "$llm_block" > services/matcher/.env
+
+    cat > ".env" <<EOF
+# ── JobCheck — root environment ───────────────────────────────────────────────
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=${gemini_api_key}
+NORMALIZER_MODEL=${llm_model}
+MATCHER_MODEL=${llm_model}
+EOF
+
+  else
+    # ── Ollama provider ───────────────────────────────────────────────────────
+    local llm_block
+    llm_block=$(cat <<EOF
+# ── LLM provider ─────────────────────────────────────────────────────────────
+LLM_PROVIDER=ollama
 # Base URL for the OpenAI-compatible Ollama API
 GEMMA_BASE_URL=http://localhost:11434/v1
 # Ollama doesn't require a real API key — any non-empty value works
 GEMMA_API_KEY=ollama
-GEMMA_MODEL=${extract_model}
-
-# ── Embedding model ───────────────────────────────────────────────────────────
-EMBEDDING_BASE_URL=http://localhost:11434/v1
-EMBEDDING_API_KEY=ollama
-EMBEDDING_MODEL=${embed_model}
+NORMALIZER_MODEL=${llm_model}
+MATCHER_MODEL=${llm_model}
 EOF
+)
+    echo "$llm_block" > services/normalizer/.env
+    echo "$llm_block" > services/matcher/.env
 
-  # Also write a shared root .env for services that need both
-  cat > ".env" <<EOF
+    cat > ".env" <<EOF
 # ── JobCheck — root environment ───────────────────────────────────────────────
-# Copy relevant variables into service-specific .env files as needed.
-
+LLM_PROVIDER=ollama
 GEMMA_BASE_URL=http://localhost:11434/v1
 GEMMA_API_KEY=ollama
-GEMMA_MODEL=${extract_model}
-
-EMBEDDING_BASE_URL=http://localhost:11434/v1
-EMBEDDING_API_KEY=ollama
-EMBEDDING_MODEL=${embed_model}
+NORMALIZER_MODEL=${llm_model}
+MATCHER_MODEL=${llm_model}
 EOF
+  fi
 
-  print_ok "Written: $env_file"
+  print_ok "Written: services/normalizer/.env"
+  print_ok "Written: services/matcher/.env"
   print_ok "Written: .env (root)"
 }
 
@@ -231,140 +250,181 @@ print_info "RAM detected     : ${RAM_GB} GB"
 print_info "Free disk space  : ${DISK_GB} GB"
 
 if (( RAM_GB > 0 && RAM_GB < 4 )); then
-  print_warn "You have less than 4 GB RAM. Only the smallest models are recommended."
+  print_warn "You have less than 4 GB RAM. Only the smallest local models are recommended."
 elif (( RAM_GB >= 4 && RAM_GB < 8 )); then
-  print_warn "You have ${RAM_GB} GB RAM. gemma4:e2b is the safer choice for the extraction model."
+  print_warn "You have ${RAM_GB} GB RAM. gemma4:e2b is the safer choice for local extraction."
 else
   print_ok "RAM looks sufficient for all available models."
 fi
 
 if (( DISK_GB < 5 )); then
-  print_warn "Less than 5 GB free disk space. Models may not fit."
+  print_warn "Less than 5 GB free disk space. Local models may not fit."
 fi
 
-# ── Ollama ────────────────────────────────────────────────────────────────────
-print_section "Ollama"
-
-if ollama_installed; then
-  OLLAMA_VER=$(ollama --version 2>/dev/null || echo "unknown")
-  print_ok "Ollama is already installed ($OLLAMA_VER)."
-else
-  print_warn "Ollama is not installed."
-  echo ""
-  echo -e "  Ollama is a local AI model runner. It provides the REST API"
-  echo -e "  that JobCheck uses to run Gemma 4 and the embedding model."
-  echo -e "  ${DIM}https://ollama.com${NC}"
-  echo ""
-  if ask_yn "Install Ollama now?"; then
-    install_ollama
-  else
-    print_err "Ollama is required. Exiting."
-    exit 1
-  fi
-fi
-
-ensure_ollama_running
-
-# ── Extraction model ──────────────────────────────────────────────────────────
-print_section "Extraction / Validation model  (Gemma 4)"
+# ── LLM backend selection ─────────────────────────────────────────────────────
+print_section "LLM backend  (normalization & matching)"
 echo ""
-echo -e "  This model runs ${BOLD}skill extraction from job postings and CVs${NC}"
-echo -e "  and validates/re-ranks candidate matches (pipeline steps 2 & 5)."
-
-show_model_table "Choose a model:" "${EXTRACT_MODELS[@]}"
+echo -e "  Choose how to run the ${BOLD}Gemma model for normalization and matching${NC}."
 echo ""
 
-# Pre-select recommendation based on RAM
-DEFAULT_EXTRACT=1
-if (( RAM_GB > 0 && RAM_GB < 8 )); then
-  DEFAULT_EXTRACT=2
-  print_warn "Based on your RAM (${RAM_GB} GB), option [2] (e2b) is pre-selected."
-fi
+ask_choice "Which LLM backend do you want to use?" \
+  "Ollama  — local, private, no API key required" \
+  "Gemini API  — cloud, requires a Google API key"
 
-ask_choice "Which extraction model do you want to install?" \
-  "$(parse_model_name "${EXTRACT_MODELS[0]}")" \
-  "$(parse_model_name "${EXTRACT_MODELS[1]}")" \
-  "Skip — I will install it manually"
-
-EXTRACT_CHOICE=$CHOICE
+LLM_BACKEND=$CHOICE
 SELECTED_EXTRACT_ID=""
+GEMINI_KEY=""
 
-if (( EXTRACT_CHOICE <= ${#EXTRACT_MODELS[@]} )); then
-  SELECTED_EXTRACT_ID=$(parse_model_id "${EXTRACT_MODELS[$((EXTRACT_CHOICE-1))]}")
-  SELECTED_EXTRACT_SIZE=$(parse_model_size "${EXTRACT_MODELS[$((EXTRACT_CHOICE-1))]}")
-  echo ""
-  print_info "Selected: ${SELECTED_EXTRACT_ID}  (download: ${SELECTED_EXTRACT_SIZE})"
-  if ask_yn "Pull ${SELECTED_EXTRACT_ID} now?"; then
-    echo ""
-    ollama pull "$SELECTED_EXTRACT_ID"
-    print_ok "${SELECTED_EXTRACT_ID} ready."
+# ── Ollama path ───────────────────────────────────────────────────────────────
+if (( LLM_BACKEND == 1 )); then
+
+  print_section "Ollama"
+
+  if ollama_installed; then
+    OLLAMA_VER=$(ollama --version 2>/dev/null || echo "unknown")
+    print_ok "Ollama is already installed ($OLLAMA_VER)."
   else
-    print_warn "Skipped. Run 'ollama pull ${SELECTED_EXTRACT_ID}' later."
-  fi
-else
-  print_info "Skipping extraction model — remember to pull one manually."
-fi
-
-# ── Embedding model ───────────────────────────────────────────────────────────
-print_section "Embedding model"
-echo ""
-echo -e "  This model encodes job skills and CV skills as vectors for"
-echo -e "  semantic similarity search (pipeline steps 3 & 4)."
-echo ""
-echo -e "  ${BOLD}Note:${NC} The pipeline uses asymmetric encoding:"
-echo -e "  ${DIM}  job skill lookups   →  \"query: <text>\"${NC}"
-echo -e "  ${DIM}  stored skills (DB)  →  \"passage: <text>\"${NC}"
-echo ""
-echo -e "  ${BOLD}[1] embeddinggemma${NC} is recommended — Google's dedicated embedding model"
-echo -e "  from the Gemma family (same architecture as the extraction model)."
-echo -e "  300M params, 622 MB, built for retrieval & semantic similarity,"
-echo -e "  supports 100+ languages including German. Requires Ollama ≥ v0.11.10."
-echo -e "  ${BOLD}[2] mxbai-embed-large${NC} is the best-benchmarked alternative (top MTEB"
-echo -e "  retrieval score), purpose-built for query/passage asymmetric search."
-
-show_model_table "Choose an embedding model:" "${EMBED_MODELS[@]}"
-echo ""
-
-ask_choice "Which embedding model do you want to install?" \
-  "$(parse_model_name "${EMBED_MODELS[0]}")" \
-  "$(parse_model_name "${EMBED_MODELS[1]}")" \
-  "$(parse_model_name "${EMBED_MODELS[2]}")" \
-  "Skip — I will install it manually"
-
-EMBED_CHOICE=$CHOICE
-SELECTED_EMBED_ID=""
-
-if (( EMBED_CHOICE <= ${#EMBED_MODELS[@]} )); then
-  SELECTED_EMBED_ID=$(parse_model_id "${EMBED_MODELS[$((EMBED_CHOICE-1))]}")
-  SELECTED_EMBED_SIZE=$(parse_model_size "${EMBED_MODELS[$((EMBED_CHOICE-1))]}")
-  echo ""
-  print_info "Selected: ${SELECTED_EMBED_ID}  (download: ${SELECTED_EMBED_SIZE})"
-
-  if ask_yn "Pull ${SELECTED_EMBED_ID} now?"; then
+    print_warn "Ollama is not installed."
     echo ""
-    ollama pull "$SELECTED_EMBED_ID"
-    print_ok "${SELECTED_EMBED_ID} ready."
-  else
-    print_warn "Skipped. Run 'ollama pull ${SELECTED_EMBED_ID}' later."
+    echo -e "  Ollama is a local AI model runner. It provides the REST API"
+    echo -e "  that JobCheck uses to run Gemma 4 and the embedding model."
+    echo -e "  ${DIM}https://ollama.com${NC}"
+    echo ""
+    if ask_yn "Install Ollama now?"; then
+      install_ollama
+    else
+      print_err "Ollama is required for local models. Exiting."
+      exit 1
+    fi
   fi
+
+  ensure_ollama_running
+
+  # Normalization / Matching model selection (Ollama)
+  print_section "Normalization & Matching model  (Gemma 4)"
+  echo ""
+  echo -e "  This model ${BOLD}normalizes job postings and CVs${NC} into compact profiles"
+  echo -e "  and scores CV-to-job matches with reasoning."
+
+  OLLAMA_EXTRACT_MODELS=(
+    "gemma4:e4b|gemma4:e4b  (4B params)|~3.5 GB|8 GB |★ Recommended — best accuracy, fits most hardware"
+    "gemma4:e2b|gemma4:e2b  (2B params)|~2.0 GB|4 GB |Lighter option — slightly lower accuracy, faster"
+  )
+
+  show_model_table "Choose a model:" "${OLLAMA_EXTRACT_MODELS[@]}"
+  echo ""
+
+  if (( RAM_GB > 0 && RAM_GB < 8 )); then
+    print_warn "Based on your RAM (${RAM_GB} GB), option [2] (e2b) is pre-selected."
+  fi
+
+  ask_choice "Which extraction model?" \
+    "$(parse_model_name "${OLLAMA_EXTRACT_MODELS[0]}")" \
+    "$(parse_model_name "${OLLAMA_EXTRACT_MODELS[1]}")" \
+    "Custom — enter a model name manually" \
+    "Skip — I will install it manually"
+
+  EXTRACT_CHOICE=$CHOICE
+
+  case $EXTRACT_CHOICE in
+    1|2)
+      SELECTED_EXTRACT_ID=$(parse_model_id "${OLLAMA_EXTRACT_MODELS[$((EXTRACT_CHOICE-1))]}")
+      SELECTED_EXTRACT_SIZE=$(parse_model_size "${OLLAMA_EXTRACT_MODELS[$((EXTRACT_CHOICE-1))]}")
+      echo ""
+      print_info "Selected: ${SELECTED_EXTRACT_ID}  (download: ${SELECTED_EXTRACT_SIZE})"
+      if ask_yn "Pull ${SELECTED_EXTRACT_ID} now?"; then
+        echo ""
+        ollama pull "$SELECTED_EXTRACT_ID"
+        print_ok "${SELECTED_EXTRACT_ID} ready."
+      else
+        print_warn "Skipped. Run 'ollama pull ${SELECTED_EXTRACT_ID}' later."
+      fi
+      ;;
+    3)
+      ask_text "Enter Ollama model name (e.g. llama3.2, mistral, phi4):"
+      SELECTED_EXTRACT_ID="$TEXT_INPUT"
+      echo ""
+      print_info "Custom model: ${SELECTED_EXTRACT_ID}"
+      if ask_yn "Pull ${SELECTED_EXTRACT_ID} now?"; then
+        echo ""
+        ollama pull "$SELECTED_EXTRACT_ID"
+        print_ok "${SELECTED_EXTRACT_ID} ready."
+      else
+        print_warn "Skipped. Run 'ollama pull ${SELECTED_EXTRACT_ID}' later."
+      fi
+      ;;
+    4)
+      print_info "Skipping extraction model — remember to pull one manually."
+      ;;
+  esac
+
+# ── Gemini path ───────────────────────────────────────────────────────────────
 else
-  print_info "Skipping embedding model — remember to pull one manually."
+
+  print_section "Gemini API"
+  echo ""
+  echo -e "  JobCheck will use the ${BOLD}Google Gemini API${NC} for extraction and validation."
+  echo -e "  You need a Gemini API key from ${CYAN}https://aistudio.google.com/apikey${NC}"
+  echo -e "  The embedding model still runs locally via Ollama."
+  echo ""
+
+  while true; do
+    ask_text "Enter your Gemini API key:"
+    GEMINI_KEY="$TEXT_INPUT"
+    if [[ -n "$GEMINI_KEY" ]]; then
+      break
+    fi
+    print_warn "API key cannot be empty."
+  done
+
+  print_ok "API key saved."
+
+  # Gemini model selection
+  echo ""
+  GEMINI_MODELS=(
+    "gemma-4-31b-it |gemma-4-31b-it   |cloud|—    |★ Recommended — good quality at low cost"
+    "gemini-2.0-flash|gemini-2.0-flash |cloud|—    |Fast and cheap — great for high volume"
+    "gemini-1.5-pro  |gemini-1.5-pro   |cloud|—    |Most capable — higher cost per request"
+  )
+
+  show_model_table "Choose a Gemini model:" "${GEMINI_MODELS[@]}"
+  echo ""
+
+  ask_choice "Which model?" \
+    "$(parse_model_name "${GEMINI_MODELS[0]}")" \
+    "$(parse_model_name "${GEMINI_MODELS[1]}")" \
+    "$(parse_model_name "${GEMINI_MODELS[2]}")" \
+    "Custom — enter a model name manually"
+
+  GEMINI_MODEL_CHOICE=$CHOICE
+
+  if (( GEMINI_MODEL_CHOICE <= ${#GEMINI_MODELS[@]} )); then
+    SELECTED_EXTRACT_ID=$(parse_model_id "${GEMINI_MODELS[$((GEMINI_MODEL_CHOICE-1))]}")
+  else
+    ask_text "Enter model name (e.g. gemini-2.0-flash-exp, gemma-3-27b-it):"
+    SELECTED_EXTRACT_ID="$TEXT_INPUT"
+  fi
+
+  echo ""
+  print_info "Selected model: ${SELECTED_EXTRACT_ID}"
+
 fi
 
 # ── .env files ────────────────────────────────────────────────────────────────
 print_section "Configuration"
 
-FINAL_EXTRACT="${SELECTED_EXTRACT_ID:-gemma4:e4b}"
-FINAL_EMBED="${SELECTED_EMBED_ID:-embeddinggemma}"
+FINAL_PROVIDER="ollama"
+if (( LLM_BACKEND == 2 )); then FINAL_PROVIDER="gemini"; fi
+
+FINAL_MODEL="${SELECTED_EXTRACT_ID:-gemma4:e4b}"
 
 echo ""
-print_info "Writing .env files with selected models:"
-print_info "  Extraction model : ${FINAL_EXTRACT}"
-print_info "  Embedding model  : ${FINAL_EMBED}"
+print_info "LLM provider : ${FINAL_PROVIDER}"
+print_info "Model        : ${FINAL_MODEL}"
 echo ""
 
 if ask_yn "Write .env files now?"; then
-  write_env "$FINAL_EXTRACT" "$FINAL_EMBED"
+  write_env "$FINAL_PROVIDER" "$FINAL_MODEL" "$GEMINI_KEY"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -373,19 +433,20 @@ echo -e "${BOLD}${GREEN}╔═════════════════�
 echo -e "${BOLD}${GREEN}║                    Setup complete!                       ║${NC}"
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${BOLD}Installed models:${NC}"
-if [[ -n "$SELECTED_EXTRACT_ID" ]]; then
-  print_ok "Extraction : $SELECTED_EXTRACT_ID"
+echo -e "  ${BOLD}Configuration:${NC}"
+print_info "LLM provider : $FINAL_PROVIDER"
+if [[ "$FINAL_PROVIDER" == "gemini" ]]; then
+  print_ok "Model        : $FINAL_MODEL  (via Gemini API)"
 else
-  print_warn "Extraction : not installed — run 'ollama pull gemma4:e4b'"
-fi
-if [[ -n "$SELECTED_EMBED_ID" ]]; then
-  print_ok "Embedding  : $SELECTED_EMBED_ID"
-else
-  print_warn "Embedding  : not installed — run 'ollama pull mxbai-embed-large'"
+  if [[ -n "$SELECTED_EXTRACT_ID" ]]; then
+    print_ok "Model        : $SELECTED_EXTRACT_ID  (Ollama local)"
+  else
+    print_warn "Model        : not installed — run 'ollama pull gemma4:e4b'"
+  fi
 fi
 echo ""
 echo -e "  ${BOLD}Next steps:${NC}"
 echo -e "  ${DIM}1.${NC} Install Node dependencies:    ${CYAN}npm install${NC}"
-echo -e "  ${DIM}2.${NC} Start the scraper service:    ${CYAN}cd services/scraper && npm run dev${NC}"
+echo -e "  ${DIM}2.${NC} Start all services:           ${CYAN}docker compose up${NC}"
+echo -e "  ${DIM}   or run a single service:      ${CYAN}cd services/scraper && npm run dev${NC}"
 echo ""

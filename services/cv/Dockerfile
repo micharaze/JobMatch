@@ -3,6 +3,7 @@ FROM node:20-slim
 WORKDIR /app
 
 COPY package*.json ./
+COPY tsconfig.base.json ./
 COPY shared/ ./shared/
 COPY services/cv/ ./services/cv/
 

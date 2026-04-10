@@ -1,190 +1,179 @@
 import Database from 'better-sqlite3';
 import path from 'path';
-import type { MatchCandidate } from '@jobcheck/shared';
+import fs from 'fs';
+import type { MatchResult } from '@jobcheck/shared';
 import logger from '../logger';
 
 const DB_PATH = process.env.DB_PATH ?? path.resolve(__dirname, '../../../../data/scraper.db');
 
-// ── Schema ────────────────────────────────────────────────────────────────────
-
-const CREATE_MATCH_RUNS = `
-  CREATE TABLE IF NOT EXISTS match_runs (
-    id             INTEGER PRIMARY KEY,
-    posting_id     TEXT NOT NULL,
-    cv_id          TEXT NOT NULL,
-    status         TEXT CHECK(status IN ('pending','processing','done','error')) DEFAULT 'pending',
-    candidate_count INTEGER,
-    error          TEXT,
-    started_at     TEXT,
-    completed_at   TEXT,
+const DDL = `
+  CREATE TABLE IF NOT EXISTS match_results (
+    id              INTEGER PRIMARY KEY,
+    posting_id      TEXT NOT NULL,
+    cv_id           TEXT NOT NULL,
+    score           INTEGER NOT NULL,
+    summary         TEXT NOT NULL,
+    matched_skills  TEXT NOT NULL DEFAULT '[]',
+    missing_skills  TEXT NOT NULL DEFAULT '[]',
+    adjacent_skills TEXT NOT NULL DEFAULT '[]',
+    model           TEXT NOT NULL,
+    matched_at      TEXT NOT NULL,
     UNIQUE(posting_id, cv_id)
-  )
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_match_results_posting
+    ON match_results(posting_id, score DESC);
 `;
 
-const CREATE_MATCH_CANDIDATES = `
-  CREATE TABLE IF NOT EXISTS match_candidates (
-    id          INTEGER PRIMARY KEY,
-    posting_id  TEXT NOT NULL,
-    cv_id       TEXT NOT NULL,
-    job_skill   TEXT NOT NULL,
-    cv_skill    TEXT NOT NULL,
-    dimension   TEXT NOT NULL,
-    priority    TEXT CHECK(priority IN ('required','preferred')) NOT NULL,
-    score       REAL NOT NULL,
-    cv_point_id TEXT NOT NULL,
-    matched_at  TEXT NOT NULL
-  )
-`;
+function open(): Database.Database {
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  db.exec(DDL);
+  logger.info('MatcherDb opened', { path: DB_PATH });
+  return db;
+}
 
-const CREATE_IDX_MC = `
-  CREATE INDEX IF NOT EXISTS idx_mc_posting_cv ON match_candidates(posting_id, cv_id)
-`;
+export interface NormalizedPosting {
+  id:              string;
+  title:           string;
+  company:         string;
+  normalized_text: string;
+}
 
-// ── DB singleton ──────────────────────────────────────────────────────────────
+export interface NormalizedCv {
+  id:              string;
+  normalized_text: string;
+}
 
 class MatcherDb {
   private db: Database.Database;
 
   constructor() {
-    this.db = new Database(DB_PATH);
-    this.db.pragma('journal_mode = WAL');
-    this.db.exec(CREATE_MATCH_RUNS);
-    this.db.exec(CREATE_MATCH_CANDIDATES);
-    this.db.exec(CREATE_IDX_MC);
-    logger.info('MatcherDb initialised', { db: DB_PATH });
+    this.db = open();
   }
 
-  // ── match_runs ──────────────────────────────────────────────────────────────
+  // ── Reads from normalizer-managed columns ────────────────────────────────────
 
-  /** Register a (posting_id × cv_id) pair — no-op if it already exists. */
-  upsertRun(postingId: string, cvId: string): void {
-    this.db
+  findNormalizedPosting(id: string): NormalizedPosting | undefined {
+    return this.db
       .prepare(
-        `INSERT OR IGNORE INTO match_runs (posting_id, cv_id, started_at)
-         VALUES (?, ?, ?)`,
+        `SELECT id, title, company, normalized_text
+         FROM job_postings
+         WHERE id = ? AND normalization_status = 'done'`,
       )
-      .run(postingId, cvId, new Date().toISOString());
+      .get(id) as NormalizedPosting | undefined;
+  }
+
+  findNormalizedCv(id: string): NormalizedCv | undefined {
+    return this.db
+      .prepare(`SELECT id, normalized_text FROM cvs WHERE id = ? AND normalization_status = 'done'`)
+      .get(id) as NormalizedCv | undefined;
+  }
+
+  getAllNormalizedCvIds(): string[] {
+    const rows = this.db
+      .prepare(`SELECT id FROM cvs WHERE normalization_status = 'done'`)
+      .all() as Array<{ id: string }>;
+    return rows.map((r) => r.id);
   }
 
   /**
-   * Atomically claim a run for processing.
-   * Returns false if the run is already processing or done.
+   * Find all (posting_id, cv_id) pairs where both are normalized but no match result exists yet.
    */
-  claimRun(postingId: string, cvId: string): boolean {
-    const result = this.db
+  getPendingPairs(): Array<{ posting_id: string; cv_id: string }> {
+    return this.db
       .prepare(
-        `UPDATE match_runs
-         SET status = 'processing', started_at = ?
-         WHERE posting_id = ? AND cv_id = ? AND status IN ('pending', 'error')`,
+        `SELECT jp.id AS posting_id, c.id AS cv_id
+         FROM job_postings jp
+         CROSS JOIN cvs c
+         LEFT JOIN match_results mr ON mr.posting_id = jp.id AND mr.cv_id = c.id
+         WHERE jp.normalization_status = 'done'
+           AND c.normalization_status  = 'done'
+           AND mr.id IS NULL`,
       )
-      .run(new Date().toISOString(), postingId, cvId);
-    return result.changes > 0;
+      .all() as Array<{ posting_id: string; cv_id: string }>;
   }
 
-  /** Store candidates and mark the run as done. */
-  saveCandidates(postingId: string, cvId: string, candidates: MatchCandidate[]): void {
-    const now = new Date().toISOString();
+  // ── match_results ─────────────────────────────────────────────────────────────
 
-    const insertCandidate = this.db.prepare(
-      `INSERT INTO match_candidates
-         (posting_id, cv_id, job_skill, cv_skill, dimension, priority, score, cv_point_id, matched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-
-    const updateRun = this.db.prepare(
-      `UPDATE match_runs
-       SET status = 'done', candidate_count = ?, completed_at = ?, error = NULL
-       WHERE posting_id = ? AND cv_id = ?`,
-    );
-
-    // Delete previous candidates for this pair before inserting fresh ones
-    this.db
-      .prepare(`DELETE FROM match_candidates WHERE posting_id = ? AND cv_id = ?`)
-      .run(postingId, cvId);
-
-    const transaction = this.db.transaction(() => {
-      for (const c of candidates) {
-        insertCandidate.run(
-          c.posting_id, c.cv_id,
-          c.job_skill, c.cv_skill,
-          c.dimension, c.priority,
-          c.score, c.cv_point_id,
-          now,
-        );
-      }
-      updateRun.run(candidates.length, now, postingId, cvId);
-    });
-
-    transaction();
-  }
-
-  /** Mark a run as failed. */
-  markError(postingId: string, cvId: string, error: string): void {
+  upsertMatchResult(result: MatchResult): void {
     this.db
       .prepare(
-        `UPDATE match_runs
-         SET status = 'error', error = ?, completed_at = ?
-         WHERE posting_id = ? AND cv_id = ?`,
+        `INSERT OR REPLACE INTO match_results
+           (posting_id, cv_id, score, summary, matched_skills, missing_skills, adjacent_skills, model, matched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(error, new Date().toISOString(), postingId, cvId);
+      .run(
+        result.posting_id,
+        result.cv_id,
+        result.score,
+        result.summary,
+        JSON.stringify(result.matched_skills),
+        JSON.stringify(result.missing_skills),
+        JSON.stringify(result.adjacent_skills),
+        result.model,
+        result.matched_at,
+      );
   }
 
-  // ── match_candidates ────────────────────────────────────────────────────────
-
-  /** Fetch candidates, optionally filtered by posting_id and/or cv_id. */
-  getCandidates(opts: {
+  findMatches(opts: {
     posting_id?: string;
     cv_id?:      string;
     limit?:      number;
     offset?:     number;
-  }): MatchCandidate[] {
+  }): MatchResult[] {
     const conditions: string[] = [];
-    const params: unknown[]    = [];
+    const params:     unknown[] = [];
 
     if (opts.posting_id) { conditions.push('posting_id = ?'); params.push(opts.posting_id); }
-    if (opts.cv_id)      { conditions.push('cv_id = ?');      params.push(opts.cv_id); }
+    if (opts.cv_id)      { conditions.push('cv_id = ?');      params.push(opts.cv_id);      }
 
     const where  = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const limit  = Math.min(opts.limit  ?? 200, 1000);
+    const limit  = Math.min(opts.limit  ?? 100, 1000);
     const offset = opts.offset ?? 0;
 
     const rows = this.db
       .prepare(
-        `SELECT posting_id, cv_id, job_skill, cv_skill, dimension, priority, score, cv_point_id
-         FROM match_candidates ${where}
+        `SELECT posting_id, cv_id, score, summary,
+                matched_skills, missing_skills, adjacent_skills, model, matched_at
+         FROM match_results ${where}
          ORDER BY score DESC
          LIMIT ? OFFSET ?`,
       )
-      .all(...params, limit, offset) as MatchCandidate[];
+      .all(...params, limit, offset) as Array<MatchResult & { matched_skills: string; missing_skills: string; adjacent_skills: string }>;
 
-    return rows;
+    return rows.map(deserialize);
   }
 
-  /** Run status counts. */
-  statusCounts(): Record<string, number> {
-    const rows = this.db
-      .prepare(`SELECT status, COUNT(*) as count FROM match_runs GROUP BY status`)
-      .all() as Array<{ status: string; count: number }>;
-
-    return Object.fromEntries(rows.map((r) => [r.status, r.count]));
-  }
-
-  /**
-   * Return all CV IDs (posting_ids from extracted_skills with source_type='cv'
-   * and embedding_status='done').
-   */
-  getEmbeddedCvIds(): string[] {
-    const rows = this.db
-      .prepare(
-        `SELECT posting_id FROM extracted_skills
-         WHERE source_type = 'cv' AND embedding_status = 'done'`,
-      )
-      .all() as Array<{ posting_id: string }>;
-    return rows.map((r) => r.posting_id);
+  findMatchByPair(postingId: string, cvId: string): MatchResult | undefined {
+    const rows = this.findMatches({ posting_id: postingId, cv_id: cvId, limit: 1 });
+    return rows[0];
   }
 
   close(): void {
     this.db.close();
+  }
+}
+
+function deserialize(
+  row: MatchResult & { matched_skills: string; missing_skills: string; adjacent_skills: string },
+): MatchResult {
+  return {
+    ...row,
+    matched_skills:  parseJsonArray(row.matched_skills),
+    missing_skills:  parseJsonArray(row.missing_skills),
+    adjacent_skills: parseJsonArray(row.adjacent_skills),
+  };
+}
+
+function parseJsonArray(json: string): string[] {
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    return Array.isArray(parsed) ? (parsed as unknown[]).filter((s): s is string => typeof s === 'string') : [];
+  } catch {
+    return [];
   }
 }
 

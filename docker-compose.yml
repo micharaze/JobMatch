@@ -13,10 +13,10 @@ services:
       - LOG_LEVEL=info
     restart: unless-stopped
 
-  extractor:
+  normalizer:
     build:
       context: .
-      dockerfile: services/extractor/Dockerfile
+      dockerfile: services/normalizer/Dockerfile
     ports:
       - "3002:3002"
     volumes:
@@ -25,35 +25,16 @@ services:
       - PORT=3002
       - DB_PATH=/app/data/scraper.db
       - LOG_LEVEL=info
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - GEMMA_BASE_URL=http://host.docker.internal:11434/v1
       - GEMMA_API_KEY=ollama
-      - GEMMA_MODEL=gemma4:e4b
+      - NORMALIZER_MODEL=${NORMALIZER_MODEL:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OLLAMA_KEEP_ALIVE=5m
       - PROCESS_INTERVAL_MS=0
     depends_on:
       - scraper
-    restart: unless-stopped
-
-  embedder:
-    build:
-      context: .
-      dockerfile: services/embedder/Dockerfile
-    ports:
-      - "3003:3003"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - PORT=3003
-      - DB_PATH=/app/data/scraper.db
-      - LANCE_DIR=/app/data/vectors
-      - LOG_LEVEL=info
-      - EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
-      - EMBEDDING_API_KEY=ollama
-      - EMBEDDING_MODEL=embeddinggemma
-      - EMBEDDING_DIM=768
-      - EMBEDDING_BATCH_SIZE=32
-    depends_on:
-      - extractor
     restart: unless-stopped
 
   matcher:
@@ -67,52 +48,16 @@ services:
     environment:
       - PORT=3004
       - DB_PATH=/app/data/scraper.db
-      - LANCE_DIR=/app/data/vectors
       - LOG_LEVEL=info
-      - EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
-      - EMBEDDING_API_KEY=ollama
-      - EMBEDDING_MODEL=embeddinggemma
-      - EMBEDDING_DIM=768
-      - MATCHER_TOP_K=5
-      - KEEP_ALIVE_MS=300000
-    depends_on:
-      - embedder
-    restart: unless-stopped
-
-  validator:
-    build:
-      context: .
-      dockerfile: services/validator/Dockerfile
-    ports:
-      - "3005:3005"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - PORT=3005
-      - DB_PATH=/app/data/scraper.db
-      - LOG_LEVEL=info
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - GEMMA_BASE_URL=http://host.docker.internal:11434/v1
       - GEMMA_API_KEY=ollama
-      - GEMMA_MODEL=gemma4:e4b
+      - MATCHER_MODEL=${MATCHER_MODEL:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OLLAMA_KEEP_ALIVE=5m
     depends_on:
-      - matcher
-    restart: unless-stopped
-
-  scorer:
-    build:
-      context: .
-      dockerfile: services/scorer/Dockerfile
-    ports:
-      - "3006:3006"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - PORT=3006
-      - DB_PATH=/app/data/scraper.db
-      - LOG_LEVEL=info
-    depends_on:
-      - validator
+      - normalizer
     restart: unless-stopped
 
   cv:
@@ -127,7 +72,7 @@ services:
       - PORT=3007
       - DB_PATH=/app/data/scraper.db
       - LOG_LEVEL=info
-      - EXTRACTOR_URL=http://extractor:3002
+      - NORMALIZER_URL=http://normalizer:3002
     depends_on:
-      - extractor
+      - normalizer
     restart: unless-stopped
