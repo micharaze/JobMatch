@@ -16,6 +16,7 @@ export const JobPostingSchema = z.object({
   posted_at: z.string().nullable(),
   scraped_at: z.string(),
   raw_html: z.string().optional(),
+  normalization_status: z.string().optional(),
 });
 
 export type JobPosting = z.infer<typeof JobPostingSchema>;

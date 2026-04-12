@@ -29,13 +29,14 @@ function open(): Database.Database {
 }
 
 export interface CvRow {
-  id:                string;
-  original_name:     string;
-  mime_type:         string;
-  text:              string;
-  uploaded_at:       string;
-  extraction_status: 'pending' | 'processing' | 'done' | 'error';
-  error:             string | null;
+  id:                   string;
+  original_name:        string;
+  mime_type:            string;
+  text:                 string;
+  uploaded_at:          string;
+  extraction_status:    'pending' | 'processing' | 'done' | 'error';
+  normalization_status: 'pending' | 'processing' | 'done' | 'error' | null;
+  error:                string | null;
 }
 
 class CvDb {
@@ -45,7 +46,7 @@ class CvDb {
     this.db = open();
   }
 
-  insert(cv: Omit<CvRow, 'extraction_status' | 'error'>): void {
+  insert(cv: Omit<CvRow, 'extraction_status' | 'normalization_status' | 'error'>): void {
     this.db
       .prepare(
         `INSERT INTO cvs (id, original_name, mime_type, text, uploaded_at)
@@ -65,7 +66,8 @@ class CvDb {
     const offset = opts.offset ?? 0;
     return this.db
       .prepare(
-        `SELECT id, original_name, mime_type, uploaded_at, extraction_status, error
+        `SELECT id, original_name, mime_type, uploaded_at, extraction_status, error,
+                normalization_status
          FROM cvs
          ORDER BY uploaded_at DESC
          LIMIT ? OFFSET ?`,

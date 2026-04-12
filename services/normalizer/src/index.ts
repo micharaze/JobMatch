@@ -7,6 +7,13 @@ const PORT               = Number(process.env.PORT ?? 3002);
 const PROCESS_INTERVAL_MS = Number(process.env.PROCESS_INTERVAL_MS ?? 0);
 
 const app = express();
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.sendStatus(204); return; }
+  next();
+});
 app.use(express.json());
 app.use('/', router);
 

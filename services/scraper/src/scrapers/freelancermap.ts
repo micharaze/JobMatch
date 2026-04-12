@@ -8,13 +8,13 @@ import { rateLimiter } from '../utils/rate-limiter';
 import { getBrowser } from '../browser';
 import logger from '../logger';
 
-const HOSTNAME = 'www.freelancermap.com';
+const DOMAINS = new Set(['freelancermap.com', 'freelancermap.de']);
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const CONTRACT_KEYWORDS = ['freelance', 'contracting', 'contract', 'full-time', 'part-time', 'festanstellung', 'permanent'];
 
 function extractSlug(url: string): string {
-  const match = url.match(/\/project\/([^/?#]+)/);
+  const match = url.match(/\/(?:project|projekt)\/([^/?#]+)/);
   if (!match) throw new Error(`Cannot extract slug from URL: ${url}`);
   return match[1];
 }
@@ -163,10 +163,10 @@ function parse(html: string, url: string): JobPosting {
 }
 
 const freelancermapScraper: Scraper = {
-  hostname: HOSTNAME,
+  hostname: 'www.freelancermap.com',
 
   canHandle(url: string): boolean {
-    try { return new URL(url).hostname === HOSTNAME; } catch { return false; }
+    try { return DOMAINS.has(new URL(url).hostname.replace(/^www\./, '')); } catch { return false; }
   },
 
   async scrape(url: string): Promise<JobPosting> {

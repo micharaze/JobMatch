@@ -76,3 +76,21 @@ services:
     depends_on:
       - normalizer
     restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: services/ui/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_SCRAPER_URL=http://localhost:3001
+      - VITE_NORMALIZER_URL=http://localhost:3002
+      - VITE_MATCHER_URL=http://localhost:3004
+      - VITE_CV_URL=http://localhost:3007
+    depends_on:
+      - scraper
+      - normalizer
+      - matcher
+      - cv
+    restart: unless-stopped

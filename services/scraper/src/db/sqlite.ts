@@ -110,7 +110,8 @@ class ScraperDb {
     const params: unknown[] = source ? [source, limit, offset] : [limit, offset];
     const rows = this.db.prepare(`
       SELECT id, source, url, author, author_company, author_email, author_tel,
-             title, company, location, description, contract_type, posted_at, scraped_at
+             title, company, location, description, contract_type, posted_at, scraped_at,
+             normalization_status
       FROM job_postings
       ${where}
       ORDER BY scraped_at DESC

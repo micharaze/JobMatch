@@ -154,6 +154,27 @@ class NormalizerDb {
       .run(id);
   }
 
+  getPostingStats(): { pending: number; processing: number; done: number; error: number } {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT normalization_status AS status, COUNT(*) AS count
+           FROM job_postings
+           GROUP BY normalization_status`,
+        )
+        .all() as Array<{ status: string; count: number }>;
+      const map = Object.fromEntries(rows.map((r) => [r.status, r.count]));
+      return {
+        pending:    map['pending']    ?? 0,
+        processing: map['processing'] ?? 0,
+        done:       map['done']       ?? 0,
+        error:      map['error']      ?? 0,
+      };
+    } catch {
+      return { pending: 0, processing: 0, done: 0, error: 0 };
+    }
+  }
+
   close(): void {
     this.db.close();
   }

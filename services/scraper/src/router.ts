@@ -7,6 +7,7 @@ import logger from './logger';
 // Import scrapers so they self-register via registerScraper()
 import './scrapers/freelancermap';
 import './scrapers/gulp';
+import './scrapers/xing';
 
 export const router = Router();
 
