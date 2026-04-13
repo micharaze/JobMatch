@@ -36,7 +36,9 @@ export function Navbar() {
             ))}
           </div>
         </div>
-        <LLMStatus />
+        <div className="hidden sm:flex shrink-0">
+          <LLMStatus />
+        </div>
       </div>
     </nav>
   );

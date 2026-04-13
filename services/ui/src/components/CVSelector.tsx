@@ -1,19 +1,21 @@
 import { useState, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Upload, FileCheck, Loader2, AlertCircle, Check } from 'lucide-react';
+import { Upload, FileCheck, Loader2, AlertCircle, Check, Trash2 } from 'lucide-react';
 import { cvApi } from '../api/cv';
 import type { CvMeta } from '../types';
 
 interface Props {
   selectedCvId: string | null;
   onSelect: (cvId: string) => void;
+  onDeselect: () => void;
 }
 
-export function CVSelector({ selectedCvId, onSelect }: Props) {
+export function CVSelector({ selectedCvId, onSelect, onDeselect }: Props) {
   const [tab, setTab] = useState<'upload' | 'existing'>('upload');
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
 
@@ -40,12 +42,19 @@ export function CVSelector({ selectedCvId, onSelect }: Props) {
       setUploadError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setUploading(false);
+      // Reset input so the same file can be re-selected
+      if (fileRef.current) fileRef.current.value = '';
     }
   }
 
-  function onFileInput(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (file) void handleFile(file);
+  async function handleDelete(cv: CvMeta) {
+    setDeletingId(cv.id);
+    try {
+      await cvApi.delete(cv.id);
+      await queryClient.invalidateQueries({ queryKey: ['cvs'] });
+      if (cv.id === selectedCvId) onDeselect();
+    } catch { /* ignore — button just re-enables */ }
+    finally { setDeletingId(null); }
   }
 
   function onDrop(e: React.DragEvent) {
@@ -80,11 +89,12 @@ export function CVSelector({ selectedCvId, onSelect }: Props) {
 
       {tab === 'upload' && (
         <div>
-          <div
+          {/* label htmlFor is the reliable way to activate file inputs across all browsers */}
+          <label
+            htmlFor="cv-file-input"
             onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
             onDragLeave={() => setDragging(false)}
             onDrop={onDrop}
-            onClick={() => fileRef.current?.click()}
             className={`flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-8 transition-colors ${
               dragging
                 ? 'border-indigo-500 bg-indigo-950/30'
@@ -100,13 +110,14 @@ export function CVSelector({ selectedCvId, onSelect }: Props) {
               {uploading ? 'Uploading…' : 'Drop PDF, DOCX, or TXT here'}
             </p>
             <p className="mt-1 text-xs text-slate-600">or click to browse</p>
-          </div>
+          </label>
           <input
+            id="cv-file-input"
             ref={fileRef}
             type="file"
             accept=".pdf,.docx,.txt"
             className="hidden"
-            onChange={onFileInput}
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleFile(f); }}
           />
           {uploadError && (
             <p className="mt-2 flex items-center gap-1 text-xs text-red-400">
@@ -124,32 +135,48 @@ export function CVSelector({ selectedCvId, onSelect }: Props) {
           {cvs.map((cv) => {
             const ready = isReady(cv);
             const isSelected = cv.id === selectedCvId;
+            const isDeleting = deletingId === cv.id;
             return (
-              <button
+              <div
                 key={cv.id}
-                onClick={() => ready && onSelect(cv.id)}
-                disabled={!ready}
-                className={`w-full flex items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                className={`flex items-center gap-2 rounded-md border px-3 py-2 transition-colors ${
                   isSelected
-                    ? 'border-indigo-500 bg-indigo-950/40 text-white'
+                    ? 'border-indigo-500 bg-indigo-950/40'
                     : ready
-                      ? 'border-slate-700 hover:border-slate-500 text-slate-300 hover:bg-slate-800/50'
-                      : 'border-slate-800 text-slate-600 cursor-not-allowed'
+                      ? 'border-slate-700 hover:border-slate-500 hover:bg-slate-800/50'
+                      : 'border-slate-800'
                 }`}
               >
-                <div className="flex items-center gap-2 min-w-0">
+                {/* Selection area */}
+                <button
+                  onClick={() => ready && onSelect(cv.id)}
+                  disabled={!ready}
+                  className={`flex flex-1 items-center gap-2 min-w-0 text-left text-sm ${
+                    isSelected ? 'text-white' : ready ? 'text-slate-300' : 'text-slate-600 cursor-not-allowed'
+                  }`}
+                >
                   <FileCheck className={`h-4 w-4 shrink-0 ${ready ? 'text-emerald-400' : 'text-slate-600'}`} />
                   <span className="truncate">{cv.original_name}</span>
-                </div>
-                <div className="flex items-center gap-2 ml-2 shrink-0">
                   {!ready && (
-                    <span className="text-xs text-amber-500">
+                    <span className="ml-auto text-xs text-amber-500 shrink-0">
                       {normStatus(cv) === 'processing' ? 'normalizing…' : 'pending'}
                     </span>
                   )}
-                  {isSelected && <Check className="h-4 w-4 text-indigo-400" />}
-                </div>
-              </button>
+                  {isSelected && <Check className="ml-auto h-4 w-4 text-indigo-400 shrink-0" />}
+                </button>
+
+                {/* Delete button */}
+                <button
+                  onClick={() => void handleDelete(cv)}
+                  disabled={isDeleting}
+                  className="shrink-0 rounded p-1 text-slate-600 hover:text-red-400 hover:bg-red-950/30 transition-colors disabled:opacity-40"
+                  title="Delete CV"
+                >
+                  {isDeleting
+                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    : <Trash2 className="h-3.5 w-3.5" />}
+                </button>
+              </div>
             );
           })}
         </div>

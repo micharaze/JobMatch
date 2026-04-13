@@ -1,10 +1,11 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Play, RotateCcw } from 'lucide-react';
 import { CVSelector } from '../components/CVSelector';
-import { JobUrlInput, parseUrls } from '../components/JobUrlInput';
+import { JobUrlInput, parseUrls, isValidUrl } from '../components/JobUrlInput';
 import { BatchProgress } from '../components/BatchProgress';
 import { JobCard } from '../components/JobCard';
+import { ScrapeErrorCard } from '../components/ScrapeErrorCard';
 import { SkillFilter } from '../components/SkillFilter';
 import { scraperApi } from '../api/scraper';
 import { normalizerApi } from '../api/normalizer';
@@ -21,6 +22,19 @@ const IDLE: BatchState = {
   matchesFound: 0,
 };
 
+const SESSION_JOB_KEY = 'upload_job';
+
+function loadJobFromSession(): BatchState {
+  try {
+    const raw = sessionStorage.getItem(SESSION_JOB_KEY);
+    if (!raw) return IDLE;
+    const parsed = JSON.parse(raw) as BatchState;
+    // Only restore terminal states — never restore in-flight runs after a page reload
+    if (parsed.step === 'done' || parsed.step === 'error') return parsed;
+  } catch { /* ignore */ }
+  return IDLE;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -36,21 +50,46 @@ function matchesFilters(match: MatchResult, filters: string[]): boolean {
 }
 
 export function UploadPage() {
-  const [selectedCvId, setSelectedCvId] = useState<string | null>(null);
-  const [urlText, setUrlText] = useState('');
-  const [job, setJob] = useState<BatchState>(IDLE);
+  const [selectedCvId, setSelectedCvId] = useState<string | null>(() =>
+    sessionStorage.getItem('upload_cvId') ?? null
+  );
+  const [urlText, setUrlText] = useState(() =>
+    sessionStorage.getItem('upload_urlText') ?? ''
+  );
+  // Restore job state from sessionStorage so results survive route navigation
+  const [job, setJob] = useState<BatchState>(loadJobFromSession);
   const [skillFilters, setSkillFilters] = useState<string[]>([]);
   const abortRef = useRef(false);
   const queryClient = useQueryClient();
 
-  // Fetch all postings (for joining with match results)
+  // Persist CV selection
+  useEffect(() => {
+    if (selectedCvId) sessionStorage.setItem('upload_cvId', selectedCvId);
+    else sessionStorage.removeItem('upload_cvId');
+  }, [selectedCvId]);
+
+  // Persist URL text
+  useEffect(() => {
+    sessionStorage.setItem('upload_urlText', urlText);
+  }, [urlText]);
+
+  // Persist job state — only terminal states; clear on idle
+  useEffect(() => {
+    if (job.step === 'idle') {
+      sessionStorage.removeItem(SESSION_JOB_KEY);
+    } else if (job.step === 'done' || job.step === 'error') {
+      sessionStorage.setItem(SESSION_JOB_KEY, JSON.stringify(job));
+    }
+  }, [job]);
+
+  // Postings are always fetched (used for joining with match results)
   const { data: postings = [] } = useQuery({
     queryKey: ['postings'],
     queryFn: () => scraperApi.listPostings(200),
     staleTime: 10_000,
   });
 
-  // Fetch match results only after a batch job has been triggered
+  // Match results — enabled whenever a job has been triggered (includes restored sessions)
   const jobTriggered = job.step !== 'idle';
   const { data: matches = [] } = useQuery({
     queryKey: ['matches', selectedCvId],
@@ -64,13 +103,12 @@ export function UploadPage() {
 
   const postingMap = new Map<string, JobPosting>(postings.map((p) => [p.id, p]));
 
-  // Restrict results to postings from the current batch job only
+  // Restrict results to postings from the current (or restored) batch job
   const batchUrlSet = new Set(job.urls);
   const batchPostingIds = new Set(
     postings.filter((p) => batchUrlSet.has(p.url)).map((p) => p.id)
   );
 
-  // Build sorted, filtered result list
   const results: Array<{ posting: JobPosting; match: MatchResult }> = matches
     .filter((m) => batchPostingIds.has(m.posting_id))
     .filter((m) => matchesFilters(m, skillFilters))
@@ -88,7 +126,6 @@ export function UploadPage() {
     if (urls.length === 0) return;
 
     abortRef.current = false;
-
     setJob({ ...IDLE, step: 'scraping', cvId: selectedCvId, urls });
 
     // 1. Scrape
@@ -96,14 +133,16 @@ export function UploadPage() {
     try {
       scrapeResult = await scraperApi.scrape(urls);
     } catch (err) {
-      setJob((j) => ({ ...j, step: 'error', errorMessage: String(err) }));
+      setJob((j) => ({ ...j, step: 'error', errorMessage: String(err).replace(/^Error:\s*/i, '') }));
       return;
     }
 
-    // Refresh postings so batchPostingIds picks up any newly scraped entries
-    // and resolve batch IDs once for the rest of the flow
-    await queryClient.invalidateQueries({ queryKey: ['postings'] });
-    const allPostings = await scraperApi.listPostings(200);
+    // Refresh postings via query cache so batchPostingIds picks up new entries
+    const allPostings = await queryClient.fetchQuery({
+      queryKey: ['postings'],
+      queryFn: () => scraperApi.listPostings(200),
+      staleTime: 0,
+    });
     const batchUrlSet = new Set(urls);
     const batchIds = new Set(allPostings.filter((p) => batchUrlSet.has(p.url)).map((p) => p.id));
 
@@ -123,7 +162,7 @@ export function UploadPage() {
       try {
         await normalizerApi.processPending(50);
       } catch (err) {
-        setJob((j) => ({ ...j, step: 'error', errorMessage: String(err) }));
+        setJob((j) => ({ ...j, step: 'error', errorMessage: String(err).replace(/^Error:\s*/i, '') }));
         return;
       }
 
@@ -134,16 +173,29 @@ export function UploadPage() {
         try {
           const stats = await normalizerApi.getStats();
           if (stats.pending === 0 && stats.processing === 0) break;
-        } catch {
-          break;
-        }
+        } catch { break; }
       }
     }
 
     if (abortRef.current) return;
 
-    // 3. Match — skip if all batch postings are already matched for this CV
-    const existingMatches = await matcherApi.listMatches({ cvId: selectedCvId, limit: 200 });
+    // Re-fetch postings to get updated normalization_status after the normalization step
+    const postingsAfterNorm = await queryClient.fetchQuery({
+      queryKey: ['postings'],
+      queryFn: () => scraperApi.listPostings(200),
+      staleTime: 0,
+    });
+    // Only postings that successfully normalized can be matched
+    const normalizedBatchCount = postingsAfterNorm.filter(
+      (p) => batchIds.has(p.id) && p.normalization_status === 'done'
+    ).length;
+
+    // 3. Match — skip if all normalized batch postings already have results for this CV
+    const existingMatches = await queryClient.fetchQuery({
+      queryKey: ['matches', selectedCvId],
+      queryFn: () => matcherApi.listMatches({ cvId: selectedCvId, limit: 200 }),
+      staleTime: 0,
+    });
     const alreadyMatchedIds = new Set(existingMatches.map((m) => m.posting_id));
     const needsMatching = [...batchIds].some((id) => !alreadyMatchedIds.has(id));
 
@@ -158,34 +210,28 @@ export function UploadPage() {
     try {
       await matcherApi.processPending();
     } catch (err) {
-      setJob((j) => ({ ...j, step: 'error', errorMessage: String(err) }));
+      setJob((j) => ({ ...j, step: 'error', errorMessage: String(err).replace(/^Error:\s*/i, '') }));
       return;
     }
 
-    // Wait for matches to appear (poll for 2 min or stability)
-    let lastCount = 0;
-    let stableFor = 0;
+    // Poll until all normalized batch postings have a match result (3 min max)
     for (let i = 0; i < 60; i++) {
       if (abortRef.current) return;
       await sleep(3000);
       try {
-        const current = await matcherApi.listMatches({ cvId: selectedCvId, limit: 200 });
+        const current = await queryClient.fetchQuery({
+          queryKey: ['matches', selectedCvId],
+          queryFn: () => matcherApi.listMatches({ cvId: selectedCvId, limit: 200 }),
+          staleTime: 0,
+        });
         const newCount = current.filter((m) => batchIds.has(m.posting_id)).length;
         setJob((j) => ({ ...j, matchesFound: newCount }));
-        if (newCount === lastCount) {
-          stableFor++;
-          if (stableFor >= 3) break; // stable for 9 seconds
-        } else {
-          stableFor = 0;
-          lastCount = newCount;
-        }
-      } catch {
-        break;
-      }
+        if (normalizedBatchCount > 0 && newCount >= normalizedBatchCount) break;
+      } catch { break; }
     }
 
     setJob((j) => ({ ...j, step: 'done' }));
-  }, [selectedCvId, urlText]);
+  }, [selectedCvId, urlText, queryClient]);
 
   const isRunning = job.step !== 'idle' && job.step !== 'done' && job.step !== 'error';
 
@@ -196,6 +242,7 @@ export function UploadPage() {
         <CVSelector
           selectedCvId={selectedCvId}
           onSelect={setSelectedCvId}
+          onDeselect={() => setSelectedCvId(null)}
         />
         <JobUrlInput value={urlText} onChange={setUrlText} />
       </div>
@@ -204,7 +251,7 @@ export function UploadPage() {
       <div className="flex items-center gap-3">
         <button
           onClick={() => { void runBatch(); }}
-          disabled={isRunning || !selectedCvId || parseUrls(urlText).length === 0}
+          disabled={isRunning || !selectedCvId || parseUrls(urlText).filter(isValidUrl).length === 0}
           className="flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <Play className="h-4 w-4" />
@@ -224,14 +271,17 @@ export function UploadPage() {
       {/* Progress */}
       {job.step !== 'idle' && <BatchProgress job={job} />}
 
-      {/* Results — only shown after a batch job has been triggered */}
-      {selectedCvId && jobTriggered && (
+      {/* Results — shown after any triggered job (including restored from session) */}
+      {selectedCvId && jobTriggered && job.step !== 'error' && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-medium text-slate-300">
               Results
-              {matches.length > 0 && (
-                <span className="ml-2 text-slate-500">({results.length} shown)</span>
+              {(matches.length > 0 || job.scrapeErrors.length > 0) && (
+                <span className="ml-2 text-slate-500">
+                  ({results.length} matched
+                  {job.scrapeErrors.length > 0 && `, ${job.scrapeErrors.length} failed`})
+                </span>
               )}
             </h2>
           </div>
@@ -253,6 +303,9 @@ export function UploadPage() {
           <div className="space-y-3">
             {results.map(({ posting, match }) => (
               <JobCard key={posting.id} posting={posting} match={match} />
+            ))}
+            {job.scrapeErrors.map((e) => (
+              <ScrapeErrorCard key={e.url} url={e.url} error={e.error} />
             ))}
           </div>
         </div>

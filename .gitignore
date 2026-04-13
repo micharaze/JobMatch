@@ -12,3 +12,4 @@ services/**/.env
 services/**/.env.*
 services/**/dist/
 services/**/data/
+.playwright-mcp/

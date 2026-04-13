@@ -145,8 +145,8 @@ router.get('/stats', (_req: Request, res: Response): void => {
 router.get('/llm-ping', async (_req: Request, res: Response): Promise<void> => {
   const provider = (process.env.LLM_PROVIDER ?? 'ollama') as 'ollama' | 'gemini';
   const model = provider === 'ollama'
-    ? (process.env.NORMALIZER_MODEL ?? process.env.GEMMA_MODEL ?? 'gemma4:e4b')
-    : (process.env.NORMALIZER_MODEL ?? process.env.GEMINI_MODEL ?? 'gemini-2.0-flash');
+    ? (process.env.NORMALIZER_MODEL || process.env.GEMMA_MODEL || 'gemma4:e4b')
+    : (process.env.NORMALIZER_MODEL || process.env.GEMINI_MODEL || 'gemini-2.0-flash');
 
   if (provider === 'gemini') {
     const hasKey = !!(process.env.GEMINI_API_KEY);
